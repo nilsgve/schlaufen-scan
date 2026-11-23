@@ -67,12 +67,33 @@ dialog h2 { margin: 0; font-size: 18px; }
 #dDelete { width: 100%; margin-top: 8px; }
 #toast { position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); max-width: 528px; margin: 0 auto; padding: 14px 16px; border-radius: 10px; background: var(--text); color: var(--bg); font-weight: 600; text-align: center; opacity: 0; pointer-events: none; transition: opacity .15s; z-index: 10; }
 #toast.show { opacity: 1; }
+#progress { background: var(--card); border-radius: 14px; padding: 14px 16px; display: grid; gap: 8px; }
+.pTop { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+#pOpen { font-size: 24px; font-variant-numeric: tabular-nums; }
+#pDone, #pNote { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.bar { height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; }
+#pBar { display: block; height: 100%; width: 0; background: var(--ok); transition: width .2s; }
+#tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+#tabs button { min-height: 44px; padding: 0 8px; font-size: 14px; background: var(--card); color: var(--muted); border: 1px solid var(--line); }
+#tabs button[aria-selected="true"] { background: var(--blue); color: var(--card); border-color: var(--blue); }
+#list li.device { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; align-items: baseline; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+#list li.device:last-child { border-bottom: 0; }
+.dev { grid-column: 1 / -1; font-size: 14px; font-weight: 500; }
+.tag { justify-self: end; font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 6px; background: var(--bad-soft); color: var(--bad); }
+.cat { justify-self: end; font-size: 12px; font-weight: 400; color: var(--muted); text-align: right; }
+#msg.ok { background: var(--ok-soft); color: var(--ok); font-weight: 600; }
 [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
   <header><h1>Schlaufen-Scan</h1><div id="count" aria-live="polite"></div></header>
+
+  <section id="progress" aria-label="Fortschritt" hidden>
+    <div class="pTop"><strong id="pOpen"></strong><span id="pDone"></span></div>
+    <div class="bar" id="pTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100"><span id="pBar"></span></div>
+    <div id="pNote"></div>
+  </section>
 
   <button id="scanCard" data-state="idle">
     <strong id="scanTitle">Scan starten</strong>
@@ -84,10 +105,18 @@ dialog h2 { margin: 0; font-size: 18px; }
     <button id="exportBtn" class="primary">CSV speichern</button>
     <button id="shareBtn">CSV teilen</button>
     <button id="importBtn" class="wide">CSV wiederherstellen</button>
+    <button id="fosterBtn" class="wide">Werkzeugliste laden</button>
     <input id="importFile" type="file" accept=".csv,text/csv,text/plain" hidden>
+    <input id="fosterFile" type="file" accept=".csv,text/csv,text/plain" hidden>
   </div>
 
-  <input id="search" type="search" placeholder="Nummer oder NFC-ID suchen" aria-label="Nummer oder NFC-ID suchen">
+  <div id="tabs" role="tablist" hidden>
+    <button role="tab" data-tab="open"></button>
+    <button role="tab" data-tab="done"></button>
+    <button role="tab" data-tab="unknown"></button>
+    <button role="tab" data-tab="nonum"></button>
+  </div>
+  <input id="search" type="search" placeholder="Nummer, Gerät, Kategorie, Ort suchen" aria-label="Nummer, Gerät, Kategorie oder Ort suchen">
   <ul id="list"></ul>
   <p id="empty"></p>
 </main>
@@ -112,7 +141,11 @@ dialog h2 { margin: 0; font-size: 18px; }
   const demo = new URLSearchParams(location.search).get('demo') === '1';
   const KEY = demo ? 'nfc-schlaufen.demo' : 'nfc-schlaufen.v1';
   const $ = id => document.getElementById(id);
+  const FOSTER_KEY = demo ? 'nfc-schlaufen.foster.demo' : 'nfc-schlaufen.foster.v1';
   let records = load();
+  let devices = loadFoster();
+  let byNum = indexDevices();
+  let tab = 'open';
   let current = null;       // { uid, digits, existing, confirmDelete }
   let ignore = { uid: '', until: 0 };
   let scanning = false;
@@ -127,6 +160,67 @@ dialog h2 { margin: 0; font-size: 18px; }
   function persist() {
     try { localStorage.setItem(KEY, JSON.stringify(records)); return true; }
     catch { toast('Speichern fehlgeschlagen. Bitte sofort CSV sichern.'); return false; }
+  }
+  function loadFoster() {
+    try {
+      const data = JSON.parse(localStorage.getItem(FOSTER_KEY) || '[]');
+      return Array.isArray(data) ? data : [];
+    } catch { return []; }
+  }
+  function indexDevices() {
+    return new Map(devices.filter(d => /^\d{6}$/.test(d.id)).map(d => [d.id, d]));
+  }
+  function deviceName(d) {
+    if (!d) return '';
+    return d.m.toLowerCase().startsWith(d.h.toLowerCase()) ? d.m : [d.h, d.m].filter(Boolean).join(' ');
+  }
+  function parseCsv(t) {
+    const rows = [];
+    let row = [], f = '', q = false;
+    const endRow = () => { row.push(f); f = ''; if (row.some(x => x.trim())) rows.push(row); row = []; };
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (q) {
+        if (c !== '"') f += c;
+        else if (t[i + 1] === '"') { f += '"'; i++; }
+        else q = false;
+      } else if (c === '"') q = true;
+      else if (c === ';') { row.push(f); f = ''; }
+      else if (c === '\n' || c === '\r') { if (c === '\r' && t[i + 1] === '\n') i++; endRow(); }
+      else f += c;
+    }
+    endRow();
+    return rows;
+  }
+  async function readText(file) {
+    const buf = await file.arrayBuffer();
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+    catch { return new TextDecoder('windows-1252').decode(buf); }
+  }
+  async function importFoster(file) {
+    const rows = parseCsv(await readText(file));
+    const head = (rows.shift() || []).map(s => s.trim());
+    const col = name => head.indexOf(name);
+    const iId = col('NFC/ID');
+    if (iId < 0 || col('Modell') < 0) return toast('Das ist keine Foster-Werkzeugliste');
+    const get = (r, name) => (col(name) < 0 ? '' : (r[col(name)] || '').trim());
+    const next = rows.map(r => {
+      const raw = (r[iId] || '').trim();
+      return {
+        // Excel entfernt führende Nullen, wenn die Liste dort gespeichert wurde.
+        id: /^\d{1,5}$/.test(raw) ? raw.padStart(6, '0') : raw,
+        h: get(r, 'Hersteller'), m: get(r, 'Modell'), k: get(r, 'Kategorie'), s: get(r, 'Seriennummer'),
+        b: get(r, 'Bemerkung').split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(' · '),
+        x: get(r, 'Geprüft bis') === 'Defekt'
+      };
+    });
+    try { localStorage.setItem(FOSTER_KEY, JSON.stringify(next)); }
+    catch { return toast('Liste zu groß für den Speicher'); }
+    devices = next;
+    byNum = indexDevices();
+    tab = 'open';
+    render();
+    toast(`${byNum.size} Geräte mit Nummer geladen`);
   }
   function normalizeUid(raw) {
     const hex = String(raw || '').replace(/[^0-9a-f]/gi, '').toUpperCase();
@@ -214,13 +308,18 @@ dialog h2 { margin: 0; font-size: 18px; }
       return c;
     }));
     $('dSave').disabled = d.length !== 6;
+    if (d.length === 6 && byNum.size) {
+      const dev = byNum.get(d);
+      if (dev) setMsg('ok', deviceName(dev) + (dev.x ? ' · Defekt' : ''));
+      else setMsg('warn', 'Nummer steht nicht in der Werkzeugliste. Bitte prüfen.');
+    }
   }
   function press(k) {
     if (!current) return;
     if (k === 'del') current.digits = current.digits.slice(0, -1);
     else if (k === 'clear') current.digits = '';
     else if (current.digits.length < 6) current.digits += k;
-    if (/^(bad|warn)$/.test($('msg').className)) setMsg('', '');
+    if (/^(bad|warn|ok)$/.test($('msg').className)) setMsg('', '');
     renderCells();
   }
   function saveEntry() {
@@ -253,31 +352,87 @@ dialog h2 { margin: 0; font-size: 18px; }
 
   function render() {
     const q = $('search').value.trim().toUpperCase();
-    const qHex = q.replace(/[^0-9A-F]/g, '');
-    const rows = records
-      .filter(r => !q || r.number.includes(q) || (qHex && r.uid.replace(/:/g, '').includes(qHex)))
-      .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    const hasList = byNum.size > 0;
+    const scanned = new Set(records.map(r => r.number));
+    const open = [...byNum.values()].filter(d => !scanned.has(d.id));
+    const unknown = records.filter(r => !byNum.has(r.number));
+    const noNumber = devices.filter(d => !/^\d{6}$/.test(d.id));
+    const doneCount = byNum.size - open.length;
+    const openDefect = open.filter(d => d.x).length;
+
     $('count').textContent = `${records.length} erfasst`;
-    $('list').replaceChildren(...rows.map(r => {
-      const li = document.createElement('li');
-      const b = document.createElement('button');
-      const n = Object.assign(document.createElement('span'), { className: 'num', textContent: r.number });
-      const u = Object.assign(document.createElement('span'), { className: 'uid', textContent: r.uid });
-      const w = Object.assign(document.createElement('span'), { className: 'when', textContent: germanDate(r.updatedAt) });
-      b.append(n, u, w);
-      b.onclick = () => openEntry(r.uid);
-      li.append(b);
-      return li;
-    }));
-    $('empty').textContent = rows.length ? '' : (records.length ? 'Kein Treffer' : 'Noch keine Schlaufen erfasst');
-    $('empty').hidden = !!rows.length;
+    $('progress').hidden = !hasList;
+    $('tabs').hidden = !hasList;
+    $('fosterBtn').textContent = hasList ? 'Werkzeugliste aktualisieren' : 'Werkzeugliste laden';
+    if (hasList) {
+      const pct = Math.floor(doneCount / byNum.size * 100);
+      $('pOpen').textContent = open.length ? `Noch ${open.length} offen` : 'Alle erfasst';
+      $('pDone').textContent = `${doneCount} von ${byNum.size} (${pct} %)`;
+      $('pBar').style.width = `${pct}%`;
+      $('pTrack').setAttribute('aria-valuenow', pct);
+      $('pNote').textContent = openDefect ? `Davon ${openDefect} als defekt markiert` : '';
+      $('pNote').hidden = !openDefect;
+      const labels = { open: `Offen (${open.length})`, done: `Erfasst (${records.length - unknown.length})`, unknown: `Nicht in Foster (${unknown.length})`, nonum: `Ohne Nummer (${noNumber.length})` };
+      for (const b of $('tabs').children) {
+        b.textContent = labels[b.dataset.tab];
+        b.setAttribute('aria-selected', String(b.dataset.tab === tab));
+      }
+    }
+
+    const hay = (...v) => v.join(' ').toUpperCase();
+    const devHay = d => hay(d.id, d.h, d.m, d.k, d.s, d.b);
+    const recHay = r => hay(r.number, r.uid, r.uid.replace(/:/g, ''), byNum.has(r.number) ? devHay(byNum.get(r.number)) : '');
+    const byCategory = (a, b) => a.k.localeCompare(b.k, 'de') || deviceName(a).localeCompare(deviceName(b), 'de');
+    const newest = (a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '');
+    let items;
+    if (hasList && (tab === 'open' || tab === 'nonum')) {
+      items = (tab === 'open' ? open : noNumber).filter(d => !q || devHay(d).includes(q)).sort(byCategory).map(deviceRow);
+    } else {
+      const base = !hasList ? records : tab === 'unknown' ? unknown : records.filter(r => byNum.has(r.number));
+      items = base.filter(r => !q || recHay(r).includes(q)).sort(newest).map(recordRow);
+    }
+    $('list').replaceChildren(...items);
+    const emptyText = q ? 'Kein Treffer'
+      : !hasList ? 'Noch keine Schlaufen erfasst'
+      : tab === 'open' ? 'Alle Geräte mit Nummer sind erfasst'
+      : tab === 'unknown' ? 'Keine Abweichungen zur Werkzeugliste'
+      : tab === 'nonum' ? 'Alle Geräte haben eine Nummer' : 'Noch keine Schlaufen erfasst';
+    $('empty').textContent = items.length ? '' : emptyText;
+    $('empty').hidden = !!items.length;
     for (const id of ['exportBtn', 'shareBtn']) $(id).disabled = !records.length;
+  }
+  const span = (className, textContent) => Object.assign(document.createElement('span'), { className, textContent });
+  function recordRow(r) {
+    const li = document.createElement('li');
+    const b = document.createElement('button');
+    b.append(span('num', r.number), span('uid', r.uid));
+    const dev = byNum.get(r.number);
+    if (dev) b.append(span('dev', deviceName(dev)));
+    b.append(span('when', germanDate(r.updatedAt)));
+    b.onclick = () => openEntry(r.uid);
+    li.append(b);
+    return li;
+  }
+  function deviceRow(d) {
+    const li = document.createElement('li');
+    li.className = 'device';
+    li.append(span('num', d.id), d.x ? span('tag', 'Defekt') : span('cat', d.k), span('dev', deviceName(d)));
+    if (d.b) li.append(span('when', d.b));
+    return li;
   }
 
   function csvBlob() {
-    const lines = ['Nummer;NFC-ID;NFC-ID ohne Trennzeichen;Erfasst am;Geändert am'];
-    [...records].sort((a, b) => a.number.localeCompare(b.number)).forEach(r =>
-      lines.push([r.number, r.uid, r.uid.replace(/:/g, ''), r.createdAt, r.updatedAt].join(';')));
+    const esc = v => {
+      let s = String(v ?? '');
+      if (/^[=+\-@]/.test(s)) s = "'" + s;
+      return /[;"\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines = ['Nummer;NFC-ID;NFC-ID ohne Trennzeichen;Erfasst am;Geändert am;In Foster;Hersteller;Modell;Kategorie;Seriennummer'];
+    [...records].sort((a, b) => a.number.localeCompare(b.number)).forEach(r => {
+      const d = byNum.get(r.number);
+      lines.push([r.number, r.uid, r.uid.replace(/:/g, ''), r.createdAt, r.updatedAt,
+        byNum.size ? (d ? 'Ja' : 'Nein') : '', d?.h, d?.m, d?.k, d?.s].map(esc).join(';'));
+    });
     return new Blob(['\uFEFF' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
   }
   const csvName = () => `nfc-schlaufen_${stamp().slice(0, 10)}.csv`;
@@ -297,16 +452,17 @@ dialog h2 { margin: 0; font-size: 18px; }
     catch (err) { if (err.name !== 'AbortError') exportCsv(); }
   }
   async function importCsv(file) {
-    const text = (await file.text()).replace(/^\uFEFF/, '');
-    const lines = text.split(/\r?\n/).filter(l => l.trim());
-    const head = (lines.shift() || '').split(';').map(s => s.replace(/"/g, '').trim());
+    const text = (await readText(file)).replace(/^\uFEFF/, '');
+    const rows = parseCsv(text);
+    const head = (rows.shift() || []).map(s => s.trim());
     const iNum = head.indexOf('Nummer'), iUid = head.indexOf('NFC-ID');
     const iNew = head.indexOf('Erfasst am'), iUpd = head.indexOf('Geändert am');
     if (iNum < 0 || iUid < 0) return toast('Datei passt nicht: Spalten fehlen');
     let added = 0, skipped = 0;
-    for (const line of lines) {
-      const c = line.split(';').map(s => s.replace(/"/g, '').trim());
-      const number = c[iNum], uid = normalizeUid(c[iUid]);
+    for (const row of rows) {
+      const c = row.map(s => s.trim());
+      const number = /^\d{1,5}$/.test(c[iNum] || '') ? c[iNum].padStart(6, '0') : c[iNum];
+      const uid = normalizeUid(c[iUid]);
       if (!/^\d{6}$/.test(number) || !uid || records.some(r => r.uid === uid || r.number === number)) { skipped++; continue; }
       const now = stamp();
       records.push({ uid, number, createdAt: c[iNew] || now, updatedAt: c[iUpd] || c[iNew] || now });
@@ -343,6 +499,17 @@ dialog h2 { margin: 0; font-size: 18px; }
     const f = e.target.files[0];
     e.target.value = '';
     if (f) await importCsv(f);
+  };
+
+  $('fosterBtn').onclick = () => $('fosterFile').click();
+  $('fosterFile').onchange = async e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (f) await importFoster(f);
+  };
+  $('tabs').onclick = e => {
+    const b = e.target.closest('button');
+    if (b) { tab = b.dataset.tab; render(); }
   };
 
   if (demo) {
