@@ -107,7 +107,7 @@ dialog h2 { margin: 0; font-size: 18px; }
     <button id="importBtn" class="wide">CSV wiederherstellen</button>
     <button id="fosterBtn" class="wide">Werkzeugliste laden</button>
     <input id="importFile" type="file" accept=".csv,text/csv,text/plain" hidden>
-    <input id="fosterFile" type="file" accept=".csv,text/csv,text/plain" hidden>
+    <input id="fosterFile" type="file" accept=".xlsx,.xls,.csv,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" hidden>
   </div>
 
   <div id="tabs" role="tablist" hidden>
@@ -197,9 +197,112 @@ dialog h2 { margin: 0; font-size: 18px; }
     try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
     catch { return new TextDecoder('windows-1252').decode(buf); }
   }
+  async function unzip(buf) {
+    const v = new DataView(buf);
+    let e = buf.byteLength - 22;
+    while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;
+    if (e < 0) throw new Error('Excel-Datei ist beschädigt');
+    const count = v.getUint16(e + 10, true);
+    let p = v.getUint32(e + 16, true);
+    const dec = new TextDecoder();
+    const files = new Map();
+    for (let i = 0; i < count; i++) {
+      if (v.getUint32(p, true) !== 0x02014b50) throw new Error('Excel-Datei ist beschädigt');
+      const nameLen = v.getUint16(p + 28, true);
+      const name = dec.decode(new Uint8Array(buf, p + 46, nameLen)).replace(/\\/g, '/');
+      files.set(name, { method: v.getUint16(p + 10, true), size: v.getUint32(p + 20, true), local: v.getUint32(p + 42, true) });
+      p += 46 + nameLen + v.getUint16(p + 30, true) + v.getUint16(p + 32, true);
+    }
+    return async name => {
+      const f = files.get(name);
+      if (!f) return null;
+      const start = f.local + 30 + v.getUint16(f.local + 26, true) + v.getUint16(f.local + 28, true);
+      const data = new Uint8Array(buf, start, f.size);
+      if (f.method === 0) return dec.decode(data);
+      if (f.method !== 8) throw new Error('Excel-Datei wird nicht unterstützt');
+      return new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+    };
+  }
+  const xml = s => new DOMParser().parseFromString(s, 'application/xml');
+  const tags = (node, name) => [...node.getElementsByTagNameNS('*', name)];
+  const cellText = node => tags(node, 't').filter(t => t.parentNode.localName !== 'rPh').map(t => t.textContent).join('');
+  function columnIndex(ref, fallback) {
+    const m = /^[A-Z]+/.exec(ref || '');
+    return m ? [...m[0]].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1 : fallback;
+  }
+  function sheetRows(doc, shared) {
+    const rows = [];
+    for (const rowEl of tags(doc, 'row')) {
+      const row = [];
+      for (const c of tags(rowEl, 'c')) {
+        const type = c.getAttribute('t');
+        const raw = tags(c, 'v')[0]?.textContent ?? '';
+        let val = raw;
+        if (type === 's') val = shared[Number(raw)] ?? '';
+        else if (type === 'inlineStr') val = cellText(c);
+        else if (type === 'e') val = '';
+        else if (type === 'b') val = raw === '1' ? 'Ja' : 'Nein';
+        else if (type !== 'str' && /e/i.test(raw) && Number.isFinite(Number(raw))) val = Number(raw).toLocaleString('fullwide', { useGrouping: false });
+        row[columnIndex(c.getAttribute('r'), row.length)] = val;
+      }
+      const filled = Array.from(row, x => x ?? '');
+      if (filled.some(x => x.trim())) rows.push(filled);
+    }
+    return rows;
+  }
+  async function readXlsx(file) {
+    const read = await unzip(await file.arrayBuffer());
+    const wb = await read('xl/workbook.xml');
+    const rels = await read('xl/_rels/workbook.xml.rels');
+    if (!wb || !rels) throw new Error('Das ist keine Excel-Tabelle');
+    const targets = new Map(tags(xml(rels), 'Relationship').map(r => [r.getAttribute('Id'), r.getAttribute('Target')]));
+    const sharedXml = await read('xl/sharedStrings.xml');
+    const shared = sharedXml ? tags(xml(sharedXml), 'si').map(cellText) : [];
+    let first = [];
+    for (const [i, s] of tags(xml(wb), 'sheet').entries()) {
+      const id = [...s.attributes].find(a => a.localName === 'id')?.value;
+      const target = targets.get(id);
+      if (!target) continue;
+      const text = await read(target.startsWith('/') ? target.slice(1) : `xl/${target}`);
+      if (!text) continue;
+      const rows = sheetRows(xml(text), shared);
+      if (i === 0) first = rows;
+      if (rows.some(r => r.some(c => c.trim() === 'NFC/ID'))) return rows;
+    }
+    return first;
+  }
+  // Repariert UTF-8-Text, den Excel als Windows-1252 gelesen hat (z. B. "PrÃ¼fung").
+  const CP1252 = [0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039, 0x152, 0x8D, 0x17D, 0x8F,
+    0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x2DC, 0x2122, 0x161, 0x203A, 0x153, 0x9D, 0x17E, 0x178];
+  function fixEncoding(s) {
+    if (!/[ÂÃâ]/.test(s)) return s;
+    const bytes = [];
+    for (const ch of s) {
+      const code = ch.codePointAt(0);
+      if (code < 0x100) bytes.push(code);
+      else {
+        const i = CP1252.indexOf(code);
+        if (i < 0) return s;
+        bytes.push(0x80 + i);
+      }
+    }
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes)); }
+    catch { return s; }
+  }
+  async function readTable(file) {
+    const m = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    if (m[0] === 0x50 && m[1] === 0x4B) return readXlsx(file);
+    if (m[0] === 0xD0 && m[1] === 0xCF) throw new Error('Alte .xls-Datei: bitte in Excel als .xlsx speichern');
+    return parseCsv(await readText(file));
+  }
   async function importFoster(file) {
-    const rows = parseCsv(await readText(file));
-    const head = (rows.shift() || []).map(s => s.trim());
+    let table;
+    try { table = (await readTable(file)).map(r => r.map(fixEncoding)); }
+    catch (err) { return toast(err.message || 'Datei konnte nicht gelesen werden'); }
+    const headAt = table.findIndex(r => r.some(c => c.trim() === 'NFC/ID'));
+    if (headAt < 0) return toast('Das ist keine Foster-Werkzeugliste');
+    const head = table[headAt].map(s => s.trim());
+    const rows = table.slice(headAt + 1);
     const col = name => head.indexOf(name);
     const iId = col('NFC/ID');
     if (iId < 0 || col('Modell') < 0) return toast('Das ist keine Foster-Werkzeugliste');
@@ -453,7 +556,7 @@ dialog h2 { margin: 0; font-size: 18px; }
   }
   async function importCsv(file) {
     const text = (await readText(file)).replace(/^\uFEFF/, '');
-    const rows = parseCsv(text);
+    const rows = parseCsv(text).map(r => r.map(fixEncoding));
     const head = (rows.shift() || []).map(s => s.trim());
     const iNum = head.indexOf('Nummer'), iUid = head.indexOf('NFC-ID');
     const iNew = head.indexOf('Erfasst am'), iUpd = head.indexOf('Geändert am');
