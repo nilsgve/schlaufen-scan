@@ -82,6 +82,23 @@ dialog h2 { margin: 0; font-size: 18px; }
 .tag { justify-self: end; font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 6px; background: var(--bad-soft); color: var(--bad); }
 .cat { justify-self: end; font-size: 12px; font-weight: 400; color: var(--muted); text-align: right; }
 #msg.ok { background: var(--ok-soft); color: var(--ok); font-weight: 600; }
+#tabs button:last-child { grid-column: 1 / -1; }
+#dUid { white-space: pre-line; }
+.tag.wide { grid-column: 1 / -1; justify-self: start; }
+#entry { max-height: 100dvh; overflow-y: auto; }
+#dReplace, #dBroken { width: 100%; margin-top: 8px; }
+#dReplace { background: var(--warn-soft); color: var(--warn); }
+#update { max-height: 88dvh; overflow-y: auto; }
+#uList { list-style: none; margin: 10px 0; padding: 0; display: grid; gap: 6px; }
+#uList li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 8px; background: var(--bg); font-size: 14px; }
+#uList strong { font-variant-numeric: tabular-nums; }
+#uWarn { padding: 8px 10px; border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-size: 14px; font-weight: 600; }
+#uConflicts { display: grid; gap: 8px; margin-bottom: 8px; }
+#uConflicts fieldset { margin: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px; }
+#uConflicts legend { font-weight: 700; padding: 0 4px; }
+#uConflicts label { display: flex; align-items: center; gap: 8px; min-height: 40px; overflow-wrap: anywhere; font-size: 13px; }
+#uConflicts input { width: 20px; height: 20px; flex: none; }
+.uBlocked { font-size: 13px; color: var(--bad); background: var(--bad-soft); padding: 8px 10px; border-radius: 8px; overflow-wrap: anywhere; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -117,6 +134,7 @@ dialog h2 { margin: 0; font-size: 18px; }
     <button role="tab" data-tab="done"></button>
     <button role="tab" data-tab="unknown"></button>
     <button role="tab" data-tab="nonum"></button>
+    <button role="tab" data-tab="archive"></button>
   </div>
   <input id="search" type="search" placeholder="Nummer, Gerät, Kategorie, Ort suchen" aria-label="Nummer, Gerät, Kategorie oder Ort suchen">
   <ul id="list"></ul>
@@ -133,7 +151,20 @@ dialog h2 { margin: 0; font-size: 18px; }
     <button id="dCancel">Abbrechen</button>
     <button id="dSave" class="primary">Speichern</button>
   </div>
+  <button id="dReplace" hidden>Chip ersetzen</button>
+  <button id="dBroken" hidden></button>
   <button id="dDelete" class="danger" hidden>Eintrag löschen</button>
+</dialog>
+
+<dialog id="update" aria-labelledby="uTitle">
+  <h2 id="uTitle">Werkzeugliste aktualisieren</h2>
+  <ul id="uList"></ul>
+  <div id="uWarn" hidden></div>
+  <div id="uConflicts"></div>
+  <div class="row">
+    <button id="uCancel">Abbrechen</button>
+    <button id="uApply" class="primary">Übernehmen</button>
+  </div>
 </dialog>
 
 <div id="toast" role="status"></div>
@@ -147,8 +178,11 @@ dialog h2 { margin: 0; font-size: 18px; }
   let records = load();
   let devices = loadFoster();
   let byNum = indexDevices();
+  const CONFLICT_KEY = demo ? 'nfc-schlaufen.conflicts.demo' : 'nfc-schlaufen.conflicts.v1';
+  let fileConflicts = loadConflicts();   // NFC-IDs aus der Datei, die keiner Nummer zugeordnet werden konnten
+  let pendingUpdate = null;
   let tab = 'open';
-  let current = null;       // { uid, digits, existing, confirmDelete }
+  let current = null;       // { uid, digits, existing, confirmDelete, replace }
   let ignore = { uid: '', until: 0 };
   let scanning = false;
   let toastTimer;
@@ -168,6 +202,18 @@ dialog h2 { margin: 0; font-size: 18px; }
       const data = JSON.parse(localStorage.getItem(FOSTER_KEY) || '[]');
       return Array.isArray(data) ? data : [];
     } catch { return []; }
+  }
+  function loadConflicts() {
+    try {
+      const data = JSON.parse(localStorage.getItem(CONFLICT_KEY) || '[]');
+      return Array.isArray(data) ? data : [];
+    } catch { return []; }
+  }
+  const isActive = r => !r.archived && !r.broken;
+  function dropConflict(number) {
+    if (!fileConflicts.some(c => c.number === number)) return;
+    fileConflicts = fileConflicts.filter(c => c.number !== number);
+    try { localStorage.setItem(CONFLICT_KEY, JSON.stringify(fileConflicts)); } catch {}
   }
   function indexDevices() {
     return new Map(devices.filter(d => /^\d{6}$/.test(d.id)).map(d => [d.id, d]));
@@ -474,11 +520,12 @@ dialog h2 { margin: 0; font-size: 18px; }
   async function buildExcel() {
     const src = loadSource();
     if (!src) { toast('Bitte Werkzeugliste einmal neu laden'); return null; }
-    const uids = new Map(records.map(r => [r.number, r.uid]));
+    const uids = new Map(fileConflicts.map(c => [c.number, c.uid]));
+    for (const r of records) uids.set(r.number, isActive(r) ? r.uid : '');
     const m = new Uint8Array(src.buf.slice(0, 2));
     const result = m[0] === 0x50 && m[1] === 0x4B ? await patchXlsx(src.buf, uids) : await csvToXlsx(src.buf, uids);
     const base = src.name.replace(/\.[^.]+$/, '').replace(/_mit_NFC$/, '');
-    const missing = records.filter(r => !byNum.has(r.number)).length;
+    const missing = records.filter(r => !r.archived && !byNum.has(r.number)).length;
     return { ...result, name: `${base}_mit_NFC.xlsx`, missing };
   }
   const excelNote = r => `${r.matched} NFC-IDs eingetragen` + (r.missing ? `, ${r.missing} nicht in Foster` : '');
@@ -551,11 +598,124 @@ dialog h2 { margin: 0; font-size: 18px; }
         x: get(r, 'Geprüft bis') === 'Defekt'
       };
     });
-    try { localStorage.setItem(FOSTER_KEY, JSON.stringify(next)); }
-    catch { return toast('Liste zu groß für den Speicher'); }
+    const iNfc = col(NFC_COLUMN);
+    const fileIds = [];
+    if (iNfc >= 0) {
+      for (const r of rows) {
+        const number = lookupId(r[iId]), uid = normalizeUid(r[iNfc]);
+        if (/^\d{6}$/.test(number) && uid) fileIds.push({ number, uid });
+      }
+    }
+    const hadList = byNum.size > 0;
+    pendingUpdate = { name: file.name, buf: await file.arrayBuffer(), next, plan: planUpdate(next, fileIds) };
+    if (!hadList && !fileIds.length) return applyUpdate();
+    showUpdate(hadList);
+  }
+  function planUpdate(next, fileIds) {
+    const newNums = new Set(next.filter(d => /^\d{6}$/.test(d.id)).map(d => d.id));
+    const oldNums = new Set(byNum.keys());
+    const plan = {
+      total: newNums.size,
+      added: [...newNums].filter(n => !oldNums.has(n)),
+      removed: [...oldNums].filter(n => !newNums.has(n)),
+      archive: records.filter(r => !r.archived && oldNums.has(r.number) && !newNums.has(r.number)),
+      restore: records.filter(r => r.archived && newNums.has(r.number)),
+      resolved: records.filter(r => !r.archived && !oldNums.has(r.number) && newNums.has(r.number)),
+      adopt: [], choose: [], blocked: []
+    };
+    const knownUid = uid => records.find(r => r.uid === uid || r.oldUids?.some(o => o.uid === uid));
+    const seen = new Set();
+    for (const { number, uid } of fileIds) {
+      if (seen.has(uid)) { plan.blocked.push({ number, uid, reason: 'steht in der Datei mehrfach' }); continue; }
+      seen.add(uid);
+      const rec = records.find(r => r.number === number);
+      if (rec && (rec.uid === uid || rec.oldUids?.some(o => o.uid === uid))) continue;
+      const other = knownUid(uid);
+      if (other) plan.blocked.push({ number, uid, reason: `gehört in der App zu ${other.number}`, hasRecord: !!rec });
+      else if (rec) plan.choose.push({ number, appUid: rec.uid, fileUid: uid });
+      else plan.adopt.push({ number, uid });
+    }
+    return plan;
+  }
+  function showUpdate(hadList) {
+    const { plan, next } = pendingUpdate;
+    const names = new Map(next.map(d => [d.id, d]));
+    const lines = [['Geräte mit Nummer', plan.total]];
+    if (hadList) lines.push(['Neu dazugekommen', plan.added.length], ['Entfallen', plan.removed.length], ['Davon mit Chip, gehen ins Archiv', plan.archive.length]);
+    if (plan.restore.length) lines.push(['Zurück aus dem Archiv', plan.restore.length]);
+    if (plan.resolved.length) lines.push(['Abweichungen geklärt', plan.resolved.length]);
+    if (plan.adopt.length) lines.push(['NFC-IDs aus der Datei übernehmen', plan.adopt.length]);
+    if (plan.choose.length + plan.blocked.length) lines.push(['Konflikte', plan.choose.length + plan.blocked.length]);
+    $('uList').replaceChildren(...lines.map(([label, n]) => {
+      const li = document.createElement('li');
+      li.append(Object.assign(document.createElement('span'), { textContent: label }), Object.assign(document.createElement('strong'), { textContent: n }));
+      return li;
+    }));
+    const share = hadList ? plan.removed.length / byNum.size : 0;
+    $('uWarn').hidden = share < 0.3;
+    $('uWarn').textContent = `${plan.removed.length} von ${byNum.size} Geräten fehlen in dieser Datei. Ist es die richtige Liste?`;
+    const nodes = plan.choose.map((c, i) => {
+      const fs = document.createElement('fieldset');
+      const lg = document.createElement('legend');
+      lg.textContent = `${c.number} ${deviceName(names.get(c.number))}`.trim();
+      fs.append(lg);
+      for (const [value, text, id] of [['app', 'App behalten', c.appUid], ['file', 'Datei nehmen', c.fileUid]]) {
+        const label = document.createElement('label');
+        const input = Object.assign(document.createElement('input'), { type: 'radio', name: `choice${i}`, value, checked: value === 'app' });
+        label.append(input, `${text}: ${id}`);
+        fs.append(label);
+      }
+      return fs;
+    });
+    for (const b of plan.blocked) {
+      nodes.push(Object.assign(document.createElement('div'), { className: 'uBlocked', textContent: `${b.number}: NFC-ID ${b.uid} ${b.reason}. Wird nicht zugeordnet.` }));
+    }
+    $('uConflicts').replaceChildren(...nodes);
+    $('update').showModal();
+  }
+  function cancelUpdate() {
+    pendingUpdate = null;
+    if ($('update').open) $('update').close();
+  }
+  function applyUpdate() {
+    if (!pendingUpdate) return;
+    const { name, buf, next, plan } = pendingUpdate;
+    const useFile = plan.choose.map((_, i) => document.querySelector(`#uConflicts input[name="choice${i}"]:checked`)?.value === 'file');
+    pendingUpdate = null;
+    if ($('update').open) $('update').close();
+    const backup = [KEY, FOSTER_KEY, CONFLICT_KEY, SOURCE_KEY].map(k => [k, localStorage.getItem(k)]);
+    const backupRecords = JSON.stringify(records);
+    const now = stamp();
+    for (const r of plan.archive) {
+      const d = byNum.get(r.number);
+      r.archived = now;
+      r.dev = d ? { h: d.h, m: d.m, k: d.k, s: d.s } : r.dev;
+    }
+    for (const r of plan.restore) { delete r.archived; delete r.dev; }
+    for (const a of plan.adopt) records.push({ uid: a.uid, number: a.number, createdAt: now, updatedAt: now });
+    plan.choose.forEach((c, i) => {
+      if (!useFile[i]) return;
+      const r = records.find(x => x.number === c.number);
+      r.oldUids = [...(r.oldUids || []), { uid: r.uid, replacedAt: now }];
+      r.uid = c.fileUid;
+      r.updatedAt = now;
+      delete r.broken;
+    });
+    const conflicts = plan.blocked.filter(b => !b.hasRecord && !records.some(r => r.number === b.number)).map(b => ({ number: b.number, uid: b.uid }));
+    try {
+      localStorage.setItem(FOSTER_KEY, JSON.stringify(next));
+      localStorage.setItem(CONFLICT_KEY, JSON.stringify(conflicts));
+      localStorage.setItem(KEY, JSON.stringify(records));
+    } catch {
+      for (const [k, v] of backup) { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); }
+      records = JSON.parse(backupRecords);
+      render();
+      return toast('Speicher voll. Liste wurde nicht übernommen.');
+    }
     let sourceSaved = true;
-    try { saveSource(file.name, await file.arrayBuffer()); }
+    try { saveSource(name, buf); }
     catch { sourceSaved = false; localStorage.removeItem(SOURCE_KEY); }
+    fileConflicts = conflicts;
     devices = next;
     byNum = indexDevices();
     tab = 'open';
@@ -617,20 +777,35 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (uid !== current.uid) { setMsg('warn', 'Anderer Tag erkannt. Erst diesen Eintrag abschließen.'); buzz([30, 60, 30]); }
       return;
     }
+    if ($('update').open) return;
     if (uid === ignore.uid && Date.now() < ignore.until) return;
+    const replaced = records.find(r => r.oldUids?.some(o => o.uid === uid));
+    if (replaced) {
+      ignore = { uid, until: Date.now() + 2500 };
+      buzz([30, 60, 30]);
+      return setScan('error', `Alter Chip von ${replaced.number}`, 'Dieser Chip wurde bereits ersetzt und zählt nicht mehr.');
+    }
     buzz(80);
     openEntry(uid);
   }
 
   function openEntry(uid) {
     const existing = records.find(r => r.uid === uid) || null;
-    current = { uid, digits: existing ? existing.number : '', existing, confirmDelete: false };
-    $('dTitle').textContent = existing ? `Bereits erfasst: ${existing.number}` : 'Neue Schlaufe';
-    $('dUid').textContent = `NFC-ID ${uid}`;
+    current = { uid, digits: existing ? existing.number : '', existing, confirmDelete: false, replace: null };
+    $('dTitle').textContent = !existing ? 'Neue Schlaufe'
+      : existing.archived ? `Archiviert: ${existing.number}`
+      : existing.broken ? `Chip defekt: ${existing.number}`
+      : `Bereits erfasst: ${existing.number}`;
+    const old = existing?.oldUids?.map(o => o.uid).join(', ');
+    $('dUid').textContent = `NFC-ID ${uid}` + (old ? `\nFrühere Chips: ${old}` : '');
     $('dDelete').hidden = !existing;
     $('dDelete').textContent = 'Eintrag löschen';
+    $('dReplace').hidden = true;
+    $('dBroken').hidden = !existing || !!existing.archived;
+    $('dBroken').textContent = existing?.broken ? 'Defekt-Markierung aufheben' : 'Chip als defekt markieren';
     setMsg('', existing ? '' : 'Aufgedruckte 6-stellige Nummer eingeben');
     renderCells();
+    if (existing?.archived) setMsg('warn', 'Gerät ist aus der Werkzeugliste entfallen.');
     if (!$('entry').open) $('entry').showModal();
   }
   function closeEntry() {
@@ -660,20 +835,60 @@ dialog h2 { margin: 0; font-size: 18px; }
     else if (k === 'clear') current.digits = '';
     else if (current.digits.length < 6) current.digits += k;
     if (/^(bad|warn|ok)$/.test($('msg').className)) setMsg('', '');
+    current.replace = null;
+    $('dReplace').hidden = true;
     renderCells();
   }
   function saveEntry() {
     if (!current || current.digits.length !== 6) return;
     const clash = records.find(r => r.number === current.digits && r.uid !== current.uid);
-    if (clash) { buzz([30, 60, 30]); return setMsg('bad', `Nummer ${clash.number} gehört schon zu ${clash.uid}.`); }
+    if (clash) {
+      buzz([30, 60, 30]);
+      if (current.existing) return setMsg('bad', `Nummer ${clash.number} gehört schon zu ${clash.uid}.`);
+      current.replace = clash;
+      $('dReplace').hidden = false;
+      return setMsg('bad', `Nummer ${clash.number} hat schon den Chip ${clash.uid}. Wurde der Chip getauscht?`);
+    }
     const now = stamp();
-    if (current.existing) { current.existing.number = current.digits; current.existing.updatedAt = now; }
-    else records.push({ uid: current.uid, number: current.digits, createdAt: now, updatedAt: now });
+    if (current.existing) {
+      if (current.existing.number !== current.digits) { delete current.existing.archived; delete current.existing.dev; }
+      current.existing.number = current.digits;
+      current.existing.updatedAt = now;
+    } else records.push({ uid: current.uid, number: current.digits, createdAt: now, updatedAt: now });
+    dropConflict(current.digits);
     const saved = persist();
     const number = current.digits;
     closeEntry();
     render();
     if (saved) { buzz([40, 40, 40]); toast(`${number} gespeichert`); }
+  }
+  function replaceChip() {
+    if (!current?.replace) return;
+    const r = current.replace;
+    const now = stamp();
+    r.oldUids = [...(r.oldUids || []), { uid: r.uid, replacedAt: now }];
+    r.uid = current.uid;
+    r.updatedAt = now;
+    delete r.broken;
+    delete r.archived;
+    delete r.dev;
+    dropConflict(r.number);
+    const saved = persist();
+    closeEntry();
+    render();
+    if (saved) { buzz([40, 40, 40]); toast(`Chip von ${r.number} ersetzt`); }
+  }
+  function toggleBroken() {
+    const r = current?.existing;
+    if (!r) return;
+    if (r.broken) delete r.broken;
+    else r.broken = stamp();
+    r.updatedAt = stamp();
+    const nowBroken = !!r.broken;
+    const saved = persist();
+    closeEntry();
+    render();
+    if (saved) toast(nowBroken ? `${r.number}: Chip defekt, Gerät wieder offen` : `${r.number}: Markierung aufgehoben`);
   }
   function deleteEntry() {
     if (!current || !current.existing) return;
@@ -693,14 +908,18 @@ dialog h2 { margin: 0; font-size: 18px; }
   function render() {
     const q = $('search').value.trim().toUpperCase();
     const hasList = byNum.size > 0;
-    const scanned = new Set(records.map(r => r.number));
+    const scanned = new Set(records.filter(isActive).map(r => r.number));
+    const brokenByNum = new Map(records.filter(r => r.broken && !r.archived).map(r => [r.number, r]));
     const open = [...byNum.values()].filter(d => !scanned.has(d.id));
-    const unknown = records.filter(r => !byNum.has(r.number));
+    const unknown = records.filter(r => !r.archived && !byNum.has(r.number));
+    const archived = records.filter(r => r.archived);
+    const done = records.filter(r => isActive(r) && byNum.has(r.number));
     const noNumber = devices.filter(d => !/^\d{6}$/.test(d.id));
     const doneCount = byNum.size - open.length;
     const openDefect = open.filter(d => d.x).length;
+    const openBroken = open.filter(d => brokenByNum.has(d.id)).length;
 
-    $('count').textContent = `${records.length} erfasst`;
+    $('count').textContent = `${records.filter(isActive).length} erfasst`;
     $('progress').hidden = !hasList;
     $('tabs').hidden = !hasList;
     $('fosterBtn').textContent = hasList ? 'Werkzeugliste aktualisieren' : 'Werkzeugliste laden';
@@ -710,9 +929,13 @@ dialog h2 { margin: 0; font-size: 18px; }
       $('pDone').textContent = `${doneCount} von ${byNum.size} (${pct} %)`;
       $('pBar').style.width = `${pct}%`;
       $('pTrack').setAttribute('aria-valuenow', pct);
-      $('pNote').textContent = openDefect ? `Davon ${openDefect} als defekt markiert` : '';
-      $('pNote').hidden = !openDefect;
-      const labels = { open: `Offen (${open.length})`, done: `Erfasst (${records.length - unknown.length})`, unknown: `Nicht in Foster (${unknown.length})`, nonum: `Ohne Nummer (${noNumber.length})` };
+      const notes = [];
+      if (openDefect) notes.push(`Davon ${openDefect} Geräte defekt`);
+      if (openBroken) notes.push(`${openBroken} mit defektem Chip`);
+      if (fileConflicts.length) notes.push(`NFC-Konflikt bei ${fileConflicts.slice(0, 3).map(c => c.number).join(', ')}${fileConflicts.length > 3 ? ' …' : ''}`);
+      $('pNote').textContent = notes.join(' · ');
+      $('pNote').hidden = !notes.length;
+      const labels = { open: `Offen (${open.length})`, done: `Erfasst (${done.length})`, unknown: `Nicht in Foster (${unknown.length})`, nonum: `Ohne Nummer (${noNumber.length})`, archive: `Archiv (${archived.length})` };
       for (const b of $('tabs').children) {
         b.textContent = labels[b.dataset.tab];
         b.setAttribute('aria-selected', String(b.dataset.tab === tab));
@@ -721,22 +944,28 @@ dialog h2 { margin: 0; font-size: 18px; }
 
     const hay = (...v) => v.join(' ').toUpperCase();
     const devHay = d => hay(d.id, d.h, d.m, d.k, d.s, d.b);
-    const recHay = r => hay(r.number, r.uid, r.uid.replace(/:/g, ''), byNum.has(r.number) ? devHay(byNum.get(r.number)) : '');
+    const recHay = r => {
+      const d = byNum.get(r.number) || r.dev;
+      const old = (r.oldUids || []).map(o => `${o.uid} ${o.uid.replace(/:/g, '')}`).join(' ');
+      return hay(r.number, r.uid, r.uid.replace(/:/g, ''), old, d ? hay(d.h, d.m, d.k, d.s, d.b || '') : '');
+    };
     const byCategory = (a, b) => a.k.localeCompare(b.k, 'de') || deviceName(a).localeCompare(deviceName(b), 'de');
     const newest = (a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '');
     let items;
     if (hasList && (tab === 'open' || tab === 'nonum')) {
-      items = (tab === 'open' ? open : noNumber).filter(d => !q || devHay(d).includes(q)).sort(byCategory).map(deviceRow);
+      items = (tab === 'open' ? open : noNumber).filter(d => !q || devHay(d).includes(q)).sort(byCategory)
+        .map(d => brokenByNum.has(d.id) ? recordRow(brokenByNum.get(d.id)) : deviceRow(d));
     } else {
-      const base = !hasList ? records : tab === 'unknown' ? unknown : records.filter(r => byNum.has(r.number));
-      items = base.filter(r => !q || recHay(r).includes(q)).sort(newest).map(recordRow);
+      const base = !hasList ? records : tab === 'unknown' ? unknown : tab === 'archive' ? archived : done;
+      items = base.filter(r => !q || recHay(r).includes(q)).sort(newest).map(r => recordRow(r));
     }
     $('list').replaceChildren(...items);
     const emptyText = q ? 'Kein Treffer'
       : !hasList ? 'Noch keine Schlaufen erfasst'
       : tab === 'open' ? 'Alle Geräte mit Nummer sind erfasst'
       : tab === 'unknown' ? 'Keine Abweichungen zur Werkzeugliste'
-      : tab === 'nonum' ? 'Alle Geräte haben eine Nummer' : 'Noch keine Schlaufen erfasst';
+      : tab === 'nonum' ? 'Alle Geräte haben eine Nummer'
+      : tab === 'archive' ? 'Archiv ist leer' : 'Noch keine Schlaufen erfasst';
     $('empty').textContent = items.length ? '' : emptyText;
     $('empty').hidden = !!items.length;
     for (const id of ['exportBtn', 'shareBtn']) $(id).disabled = !records.length;
@@ -747,9 +976,11 @@ dialog h2 { margin: 0; font-size: 18px; }
     const li = document.createElement('li');
     const b = document.createElement('button');
     b.append(span('num', r.number), span('uid', r.uid));
-    const dev = byNum.get(r.number);
+    const label = r.archived ? 'Archiviert' : r.broken ? 'Chip defekt' : r.oldUids?.length ? 'Chip getauscht' : '';
+    if (label) b.append(span('tag wide', label));
+    const dev = byNum.get(r.number) || r.dev;
     if (dev) b.append(span('dev', deviceName(dev)));
-    b.append(span('when', germanDate(r.updatedAt)));
+    b.append(span('when', germanDate(r.archived || r.updatedAt)));
     b.onclick = () => openEntry(r.uid);
     li.append(b);
     return li;
@@ -768,11 +999,14 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (/^[=+\-@]/.test(s)) s = "'" + s;
       return /[;"\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const lines = ['Nummer;NFC-ID;NFC-ID ohne Trennzeichen;Erfasst am;Geändert am;In Foster;Hersteller;Modell;Kategorie;Seriennummer'];
+    const lines = ['Nummer;NFC-ID;NFC-ID ohne Trennzeichen;Erfasst am;Geändert am;In Foster;Hersteller;Modell;Kategorie;Seriennummer;Status;Alte NFC-IDs'];
     [...records].sort((a, b) => a.number.localeCompare(b.number)).forEach(r => {
-      const d = byNum.get(r.number);
+      const inList = byNum.get(r.number);
+      const d = inList || r.dev;
+      const status = r.archived ? 'Archiviert' : r.broken ? 'Chip defekt' : 'Aktiv';
+      const old = (r.oldUids || []).map(o => `${o.uid}@${o.replacedAt}`).join('|');
       lines.push([r.number, r.uid, r.uid.replace(/:/g, ''), r.createdAt, r.updatedAt,
-        byNum.size ? (d ? 'Ja' : 'Nein') : '', d?.h, d?.m, d?.k, d?.s].map(esc).join(';'));
+        byNum.size ? (inList ? 'Ja' : 'Nein') : '', d?.h, d?.m, d?.k, d?.s, status, old].map(esc).join(';'));
     });
     return new Blob(['\uFEFF' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
   }
@@ -804,9 +1038,22 @@ dialog h2 { margin: 0; font-size: 18px; }
       const c = row.map(s => s.trim());
       const number = /^\d{1,5}$/.test(c[iNum] || '') ? c[iNum].padStart(6, '0') : c[iNum];
       const uid = normalizeUid(c[iUid]);
-      if (!/^\d{6}$/.test(number) || !uid || records.some(r => r.uid === uid || r.number === number)) { skipped++; continue; }
+      if (!/^\d{6}$/.test(number) || !uid || records.some(r => r.uid === uid || r.number === number || r.oldUids?.some(o => o.uid === uid))) { skipped++; continue; }
       const now = stamp();
-      records.push({ uid, number, createdAt: c[iNew] || now, updatedAt: c[iUpd] || c[iNew] || now });
+      const rec = { uid, number, createdAt: c[iNew] || now, updatedAt: c[iUpd] || c[iNew] || now };
+      const status = c[head.indexOf('Status')];
+      if (status === 'Chip defekt') rec.broken = rec.updatedAt;
+      if (status === 'Archiviert') {
+        rec.archived = rec.updatedAt;
+        const part = name => c[head.indexOf(name)] || '';
+        rec.dev = { h: part('Hersteller'), m: part('Modell'), k: part('Kategorie'), s: part('Seriennummer') };
+      }
+      const old = (c[head.indexOf('Alte NFC-IDs')] || '').split('|').map(s => {
+        const [oldUid, replacedAt] = s.split('@');
+        return { uid: normalizeUid(oldUid), replacedAt: replacedAt || '' };
+      }).filter(o => o.uid);
+      if (old.length) rec.oldUids = old;
+      records.push(rec);
       added++;
     }
     persist();
@@ -826,6 +1073,11 @@ dialog h2 { margin: 0; font-size: 18px; }
   $('dSave').onclick = saveEntry;
   $('dCancel').onclick = closeEntry;
   $('dDelete').onclick = deleteEntry;
+  $('dReplace').onclick = replaceChip;
+  $('dBroken').onclick = toggleBroken;
+  $('uApply').onclick = applyUpdate;
+  $('uCancel').onclick = cancelUpdate;
+  $('update').addEventListener('cancel', e => { e.preventDefault(); cancelUpdate(); });
   $('entry').addEventListener('cancel', e => { e.preventDefault(); closeEntry(); });
   $('entry').addEventListener('keydown', e => {
     if (/^\d$/.test(e.key)) press(e.key);
