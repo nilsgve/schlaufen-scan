@@ -99,6 +99,8 @@ dialog h2 { margin: 0; font-size: 18px; }
 #uConflicts label { display: flex; align-items: center; gap: 8px; min-height: 40px; overflow-wrap: anywhere; font-size: 13px; }
 #uConflicts input { width: 20px; height: 20px; flex: none; }
 .uBlocked { font-size: 13px; color: var(--bad); background: var(--bad-soft); padding: 8px 10px; border-radius: 8px; overflow-wrap: anywhere; }
+#list li.group { display: flex; justify-content: space-between; gap: 12px; padding: 8px 14px; background: var(--blue-soft); color: var(--blue); font-size: 14px; font-weight: 700; border-bottom: 1px solid var(--line); }
+#openShareBtn { width: 100%; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -136,6 +138,7 @@ dialog h2 { margin: 0; font-size: 18px; }
     <button role="tab" data-tab="nonum"></button>
     <button role="tab" data-tab="archive"></button>
   </div>
+  <button id="openShareBtn" hidden>Offene Liste teilen</button>
   <input id="search" type="search" placeholder="Nummer, Gerät, Kategorie, Ort suchen" aria-label="Nummer, Gerät, Kategorie oder Ort suchen">
   <ul id="list"></ul>
   <p id="empty"></p>
@@ -218,6 +221,11 @@ dialog h2 { margin: 0; font-size: 18px; }
   function indexDevices() {
     return new Map(devices.filter(d => /^\d{6}$/.test(d.id)).map(d => [d.id, d]));
   }
+  // Fahrzeuge stehen in Foster mit dem Kennzeichen statt einer Nummer (z. B. "HSK-K 349", Elektro "HSK-K 388E").
+  // Sie haben keine Prüfschlaufe und werden in keiner Liste gezeigt.
+  const isPlate = id => /^[A-ZÄÖÜ]{1,3}-[A-Z]{1,2} ?\d{1,4}[EH]?$/.test(String(id || '').trim().toUpperCase());
+  // Standort = erste Zeile der Foster-Bemerkung (z. B. "Lager / Name")
+  const place = d => (d.b || '').split(' · ')[0] || 'Ohne Standort';
   function deviceName(d) {
     if (!d) return '';
     return d.m.toLowerCase().startsWith(d.h.toLowerCase()) ? d.m : [d.h, d.m].filter(Boolean).join(' ');
@@ -914,7 +922,8 @@ dialog h2 { margin: 0; font-size: 18px; }
     const unknown = records.filter(r => !r.archived && !byNum.has(r.number));
     const archived = records.filter(r => r.archived);
     const done = records.filter(r => isActive(r) && byNum.has(r.number));
-    const noNumber = devices.filter(d => !/^\d{6}$/.test(d.id));
+    const noNumber = devices.filter(d => !/^\d{6}$/.test(d.id) && !isPlate(d.id));
+    const plates = devices.filter(d => isPlate(d.id)).length;
     const doneCount = byNum.size - open.length;
     const openDefect = open.filter(d => d.x).length;
     const openBroken = open.filter(d => brokenByNum.has(d.id)).length;
@@ -933,6 +942,7 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (openDefect) notes.push(`Davon ${openDefect} Geräte defekt`);
       if (openBroken) notes.push(`${openBroken} mit defektem Chip`);
       if (fileConflicts.length) notes.push(`NFC-Konflikt bei ${fileConflicts.slice(0, 3).map(c => c.number).join(', ')}${fileConflicts.length > 3 ? ' …' : ''}`);
+      if (plates) notes.push(`${plates} Fahrzeuge mit Kennzeichen ausgeblendet`);
       $('pNote').textContent = notes.join(' · ');
       $('pNote').hidden = !notes.length;
       const labels = { open: `Offen (${open.length})`, done: `Erfasst (${done.length})`, unknown: `Nicht in Foster (${unknown.length})`, nonum: `Ohne Nummer (${noNumber.length})`, archive: `Archiv (${archived.length})` };
@@ -950,11 +960,20 @@ dialog h2 { margin: 0; font-size: 18px; }
       return hay(r.number, r.uid, r.uid.replace(/:/g, ''), old, d ? hay(d.h, d.m, d.k, d.s, d.b || '') : '');
     };
     const byCategory = (a, b) => a.k.localeCompare(b.k, 'de') || deviceName(a).localeCompare(deviceName(b), 'de');
+    const noPlace = d => place(d) === 'Ohne Standort';
+    const byPlace = (a, b) => (noPlace(a) - noPlace(b)) || place(a).localeCompare(place(b), 'de');
     const newest = (a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '');
     let items;
-    if (hasList && (tab === 'open' || tab === 'nonum')) {
-      items = (tab === 'open' ? open : noNumber).filter(d => !q || devHay(d).includes(q)).sort(byCategory)
-        .map(d => brokenByNum.has(d.id) ? recordRow(brokenByNum.get(d.id)) : deviceRow(d));
+    if (hasList && tab === 'open') {
+      // Nach Standort gruppiert, damit man die letzten Geräte Raum für Raum suchen kann
+      const rows = open.filter(d => !q || devHay(d).includes(q)).sort((a, b) => byPlace(a, b) || byCategory(a, b));
+      items = [];
+      rows.forEach((d, i) => {
+        if (i === 0 || place(rows[i - 1]) !== place(d)) items.push(groupRow(place(d), rows.filter(x => place(x) === place(d)).length));
+        items.push(brokenByNum.has(d.id) ? recordRow(brokenByNum.get(d.id)) : deviceRow(d));
+      });
+    } else if (hasList && tab === 'nonum') {
+      items = noNumber.filter(d => !q || devHay(d).includes(q)).sort(byCategory).map(deviceRow);
     } else {
       const base = !hasList ? records : tab === 'unknown' ? unknown : tab === 'archive' ? archived : done;
       items = base.filter(r => !q || recHay(r).includes(q)).sort(newest).map(r => recordRow(r));
@@ -970,6 +989,34 @@ dialog h2 { margin: 0; font-size: 18px; }
     $('empty').hidden = !!items.length;
     for (const id of ['exportBtn', 'shareBtn']) $(id).disabled = !records.length;
     for (const id of ['xlsxBtn', 'xlsxShareBtn']) { $(id).hidden = !hasList; $(id).disabled = !records.length; }
+    $('openShareBtn').hidden = !hasList || tab !== 'open' || !open.length;
+    $('openShareBtn').textContent = `Offene Liste teilen (${open.length})`;
+  }
+  function groupRow(name, n) {
+    const li = document.createElement('li');
+    li.className = 'group';
+    li.append(span('', name), span('', String(n)));
+    return li;
+  }
+  // Noch fehlende Geräte als CSV: zum Weitergeben, Ausdrucken oder Abhaken bei den letzten Geräten
+  function openCsvBlob() {
+    const esc = v => { let s = String(v ?? ''); if (/^[=+\-@]/.test(s)) s = "'" + s; return /[;"\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    const scanned = new Set(records.filter(isActive).map(r => r.number));
+    const broken = new Set(records.filter(r => r.broken && !r.archived).map(r => r.number));
+    const rows = [...byNum.values()].filter(d => !scanned.has(d.id))
+      .sort((a, b) => ((place(a) === 'Ohne Standort') - (place(b) === 'Ohne Standort')) || place(a).localeCompare(place(b), 'de') || a.k.localeCompare(b.k, 'de'));
+    const lines = ['Standort;Nummer;Gerät;Kategorie;Seriennummer;Hinweis;Bemerkung'];
+    for (const d of rows) lines.push([place(d), d.id, deviceName(d), d.k, d.s, [d.x ? 'Gerät defekt' : '', broken.has(d.id) ? 'Chip defekt' : ''].filter(Boolean).join(', '), d.b].map(esc).join(';'));
+    return new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
+  }
+  async function shareOpen() {
+    const file = new File([openCsvBlob()], `noch-offen_${stamp().slice(0, 10)}.csv`, { type: 'text/csv' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: file.name }); return; }
+      catch (err) { if (err.name === 'AbortError') return; }
+    }
+    downloadBlob(file, file.name);
+    toast('Liste gespeichert');
   }
   const span = (className, textContent) => Object.assign(document.createElement('span'), { className, textContent });
   function recordRow(r) {
@@ -1094,6 +1141,7 @@ dialog h2 { margin: 0; font-size: 18px; }
     if (f) await importCsv(f);
   };
 
+  $('openShareBtn').onclick = shareOpen;
   $('xlsxBtn').onclick = () => exportExcel(false);
   $('xlsxShareBtn').onclick = () => exportExcel(true);
   $('fosterBtn').onclick = () => $('fosterFile').click();
