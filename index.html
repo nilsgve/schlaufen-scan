@@ -101,6 +101,15 @@ dialog h2 { margin: 0; font-size: 18px; }
 .uBlocked { font-size: 13px; color: var(--bad); background: var(--bad-soft); padding: 8px 10px; border-radius: 8px; overflow-wrap: anywhere; }
 #list li.group { display: flex; justify-content: space-between; gap: 12px; padding: 8px 14px; background: var(--blue-soft); color: var(--blue); font-size: 14px; font-weight: 700; border-bottom: 1px solid var(--line); }
 #openShareBtn { width: 100%; }
+#kind { margin-top: 10px; display: grid; gap: 8px; }
+.kindHead { font-size: 14px; font-weight: 700; color: var(--warn); }
+.kindBtns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.kindBtns button { min-height: 44px; font-size: 14px; background: var(--bg); color: var(--text); border: 2px solid var(--line); }
+.kindBtns button[aria-pressed="true"] { border-color: var(--blue); background: var(--blue-soft); color: var(--blue); }
+#kForm { display: grid; gap: 6px; }
+#kForm input { width: 100%; height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.tag.vorrat { background: var(--blue-soft); color: var(--blue); }
+.tag.ohne { background: var(--warn-soft); color: var(--warn); }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -150,6 +159,20 @@ dialog h2 { margin: 0; font-size: 18px; }
   <div id="cells" aria-live="polite"></div>
   <div id="msg" role="status"></div>
   <div id="pad"></div>
+  <div id="kind" hidden>
+    <div class="kindHead">Nicht in Foster. Was ist das?</div>
+    <div class="kindBtns">
+      <button type="button" id="kVorrat" aria-pressed="false">Lose Schlaufe (Vorrat)</button>
+      <button type="button" id="kGeraet" aria-pressed="false">Gerät ohne Foster</button>
+    </div>
+    <div id="kForm" hidden>
+      <input id="kH" placeholder="Hersteller" aria-label="Hersteller" autocomplete="off">
+      <input id="kM" placeholder="Gerät / Modell" aria-label="Gerät oder Modell" autocomplete="off">
+      <input id="kK" placeholder="Kategorie" aria-label="Kategorie" list="kCats" autocomplete="off">
+      <input id="kN" placeholder="Standort / Notiz (z. B. Tippfehler in Foster?)" aria-label="Standort oder Notiz" autocomplete="off">
+      <datalist id="kCats"></datalist>
+    </div>
+  </div>
   <div class="row">
     <button id="dCancel">Abbrechen</button>
     <button id="dSave" class="primary">Speichern</button>
@@ -799,7 +822,11 @@ dialog h2 { margin: 0; font-size: 18px; }
 
   function openEntry(uid) {
     const existing = records.find(r => r.uid === uid) || null;
-    current = { uid, digits: existing ? existing.number : '', existing, confirmDelete: false, replace: null };
+    current = { uid, digits: existing ? existing.number : '', existing, confirmDelete: false, replace: null, kind: existing?.kind || '' };
+    // Nummer nicht in Foster: lose Schlaufe (Vorrat) oder ein Gerät, das in Foster fehlt (z. B. Tippfehler dort)
+    const info = existing?.info || {};
+    for (const [id, k] of [['kH', 'h'], ['kM', 'm'], ['kK', 'k'], ['kN', 'n']]) $(id).value = info[k] || '';
+    $('kCats').replaceChildren(...[...new Set(devices.map(d => d.k).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'de')).map(k => Object.assign(document.createElement('option'), { value: k })));
     $('dTitle').textContent = !existing ? 'Neue Schlaufe'
       : existing.archived ? `Archiviert: ${existing.number}`
       : existing.broken ? `Chip defekt: ${existing.number}`
@@ -836,6 +863,21 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (dev) setMsg('ok', deviceName(dev) + (dev.x ? ' · Defekt' : ''));
       else setMsg('warn', 'Nummer steht nicht in der Werkzeugliste. Bitte prüfen.');
     }
+    renderKind();
+  }
+  const needsKind = () => !!current && byNum.size > 0 && current.digits.length === 6 && !byNum.has(current.digits);
+  function renderKind() {
+    const show = needsKind();
+    $('kind').hidden = !show;
+    $('kVorrat').setAttribute('aria-pressed', String(show && current.kind === 'vorrat'));
+    $('kGeraet').setAttribute('aria-pressed', String(show && current.kind === 'geraet'));
+    $('kForm').hidden = !(show && current.kind === 'geraet');
+  }
+  function chooseKind(k) {
+    if (!current) return;
+    current.kind = k;
+    renderKind();
+    if (k === 'geraet') $('kM').focus();
   }
   function press(k) {
     if (!current) return;
@@ -849,6 +891,15 @@ dialog h2 { margin: 0; font-size: 18px; }
   }
   function saveEntry() {
     if (!current || current.digits.length !== 6) return;
+    if (needsKind() && !current.kind) { buzz([30, 60, 30]); return setMsg('warn', 'Bitte wählen: lose Schlaufe oder Gerät ohne Foster.'); }
+    const info = { h: $('kH').value.trim(), m: $('kM').value.trim(), k: $('kK').value.trim(), n: $('kN').value.trim() };
+    if (needsKind() && current.kind === 'geraet' && !info.m) { $('kM').focus(); return setMsg('warn', 'Bitte eintragen, was für ein Gerät das ist.'); }
+    // Steht die Nummer in Foster, gibt es keine Art; sonst Vorrat oder Gerät mit kurzer Beschreibung
+    const kindOf = rec => {
+      if (!needsKind()) { delete rec.kind; delete rec.info; return; }
+      rec.kind = current.kind;
+      if (current.kind === 'geraet') rec.info = info; else delete rec.info;
+    };
     const clash = records.find(r => r.number === current.digits && r.uid !== current.uid);
     if (clash) {
       buzz([30, 60, 30]);
@@ -862,7 +913,12 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (current.existing.number !== current.digits) { delete current.existing.archived; delete current.existing.dev; }
       current.existing.number = current.digits;
       current.existing.updatedAt = now;
-    } else records.push({ uid: current.uid, number: current.digits, createdAt: now, updatedAt: now });
+      kindOf(current.existing);
+    } else {
+      const rec = { uid: current.uid, number: current.digits, createdAt: now, updatedAt: now };
+      kindOf(rec);
+      records.push(rec);
+    }
     dropConflict(current.digits);
     const saved = persist();
     const number = current.digits;
@@ -943,6 +999,8 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (openBroken) notes.push(`${openBroken} mit defektem Chip`);
       if (fileConflicts.length) notes.push(`NFC-Konflikt bei ${fileConflicts.slice(0, 3).map(c => c.number).join(', ')}${fileConflicts.length > 3 ? ' …' : ''}`);
       if (plates) notes.push(`${plates} Fahrzeuge mit Kennzeichen ausgeblendet`);
+      const vorrat = unknown.filter(r => r.kind === 'vorrat').length, ohne = unknown.filter(r => r.kind === 'geraet').length, offen = unknown.length - vorrat - ohne;
+      if (unknown.length) notes.push([vorrat && `${vorrat} ${vorrat === 1 ? 'Schlaufe' : 'Schlaufen'} im Vorrat`, ohne && `${ohne} ${ohne === 1 ? 'Gerät' : 'Geräte'} ohne Foster`, offen && `${offen} ungeklärt`].filter(Boolean).join(', '));
       $('pNote').textContent = notes.join(' · ');
       $('pNote').hidden = !notes.length;
       const labels = { open: `Offen (${open.length})`, done: `Erfasst (${done.length})`, unknown: `Nicht in Foster (${unknown.length})`, nonum: `Ohne Nummer (${noNumber.length})`, archive: `Archiv (${archived.length})` };
@@ -957,7 +1015,8 @@ dialog h2 { margin: 0; font-size: 18px; }
     const recHay = r => {
       const d = byNum.get(r.number) || r.dev;
       const old = (r.oldUids || []).map(o => `${o.uid} ${o.uid.replace(/:/g, '')}`).join(' ');
-      return hay(r.number, r.uid, r.uid.replace(/:/g, ''), old, d ? hay(d.h, d.m, d.k, d.s, d.b || '') : '');
+      const i = r.info ? hay(r.info.h, r.info.m, r.info.k, r.info.n) : '';
+      return hay(r.number, r.uid, r.uid.replace(/:/g, ''), old, i, r.kind === 'vorrat' ? 'VORRAT' : '', d ? hay(d.h, d.m, d.k, d.s, d.b || '') : '');
     };
     const byCategory = (a, b) => a.k.localeCompare(b.k, 'de') || deviceName(a).localeCompare(deviceName(b), 'de');
     const noPlace = d => place(d) === 'Ohne Standort';
@@ -1025,8 +1084,11 @@ dialog h2 { margin: 0; font-size: 18px; }
     b.append(span('num', r.number), span('uid', r.uid));
     const label = r.archived ? 'Archiviert' : r.broken ? 'Chip defekt' : r.oldUids?.length ? 'Chip getauscht' : '';
     if (label) b.append(span('tag wide', label));
-    const dev = byNum.get(r.number) || r.dev;
+    const ohneFoster = !r.archived && byNum.size > 0 && !byNum.has(r.number);
+    if (ohneFoster) b.append(span(`tag wide ${r.kind === 'vorrat' ? 'vorrat' : r.kind === 'geraet' ? 'ohne' : ''}`, r.kind === 'vorrat' ? 'Vorrat' : r.kind === 'geraet' ? 'Gerät ohne Foster' : 'Ungeklärt: antippen'));
+    const dev = byNum.get(r.number) || r.dev || (r.kind === 'geraet' && r.info ? { h: r.info.h, m: r.info.m } : null);
     if (dev) b.append(span('dev', deviceName(dev)));
+    if (ohneFoster && r.info?.n) b.append(span('when', r.info.n));
     b.append(span('when', germanDate(r.archived || r.updatedAt)));
     b.onclick = () => openEntry(r.uid);
     li.append(b);
@@ -1046,14 +1108,16 @@ dialog h2 { margin: 0; font-size: 18px; }
       if (/^[=+\-@]/.test(s)) s = "'" + s;
       return /[;"\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const lines = ['Nummer;NFC-ID;NFC-ID ohne Trennzeichen;Erfasst am;Geändert am;In Foster;Hersteller;Modell;Kategorie;Seriennummer;Status;Alte NFC-IDs'];
+    // "Art": leer = Gerät aus Foster, "Vorrat" = lose Schlaufe, "Gerät ohne Foster" = Gerät mit Schlaufe, das in Foster fehlt
+    const lines = ['Nummer;NFC-ID;NFC-ID ohne Trennzeichen;Erfasst am;Geändert am;In Foster;Hersteller;Modell;Kategorie;Seriennummer;Status;Alte NFC-IDs;Art;Notiz'];
     [...records].sort((a, b) => a.number.localeCompare(b.number)).forEach(r => {
       const inList = byNum.get(r.number);
-      const d = inList || r.dev;
+      const d = inList || r.dev || (r.kind === 'geraet' ? r.info : null);
       const status = r.archived ? 'Archiviert' : r.broken ? 'Chip defekt' : 'Aktiv';
       const old = (r.oldUids || []).map(o => `${o.uid}@${o.replacedAt}`).join('|');
+      const art = inList ? '' : r.kind === 'vorrat' ? 'Vorrat' : r.kind === 'geraet' ? 'Gerät ohne Foster' : '';
       lines.push([r.number, r.uid, r.uid.replace(/:/g, ''), r.createdAt, r.updatedAt,
-        byNum.size ? (inList ? 'Ja' : 'Nein') : '', d?.h, d?.m, d?.k, d?.s, status, old].map(esc).join(';'));
+        byNum.size ? (inList ? 'Ja' : 'Nein') : '', d?.h, d?.m, d?.k, d?.s, status, old, art, inList ? '' : r.info?.n].map(esc).join(';'));
     });
     return new Blob(['\uFEFF' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
   }
@@ -1100,6 +1164,10 @@ dialog h2 { margin: 0; font-size: 18px; }
         return { uid: normalizeUid(oldUid), replacedAt: replacedAt || '' };
       }).filter(o => o.uid);
       if (old.length) rec.oldUids = old;
+      const art = c[head.indexOf('Art')] || '';
+      const part = name => c[head.indexOf(name)] || '';
+      if (art === 'Vorrat') rec.kind = 'vorrat';
+      if (art === 'Gerät ohne Foster') { rec.kind = 'geraet'; rec.info = { h: part('Hersteller'), m: part('Modell'), k: part('Kategorie'), n: part('Notiz') }; }
       records.push(rec);
       added++;
     }
@@ -1126,7 +1194,11 @@ dialog h2 { margin: 0; font-size: 18px; }
   $('uCancel').onclick = cancelUpdate;
   $('update').addEventListener('cancel', e => { e.preventDefault(); cancelUpdate(); });
   $('entry').addEventListener('cancel', e => { e.preventDefault(); closeEntry(); });
+  $('kVorrat').onclick = () => chooseKind('vorrat');
+  $('kGeraet').onclick = () => chooseKind('geraet');
   $('entry').addEventListener('keydown', e => {
+    // In den Textfeldern für "Gerät ohne Foster" normal tippen, nicht in die Nummer
+    if (e.target.closest && e.target.closest('#kForm')) { if (e.key === 'Enter') { e.preventDefault(); saveEntry(); } return; }
     if (/^\d$/.test(e.key)) press(e.key);
     else if (e.key === 'Backspace') press('del');
     else if (e.key === 'Enter') { e.preventDefault(); saveEntry(); }
