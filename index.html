@@ -779,13 +779,57 @@ dialog h2 { margin: 0; font-size: 18px; }
     $('scanTitle').textContent = title;
     $('scanText').textContent = text;
   }
-  const ready = () => setScan('scanning', 'Bereit zum Scannen', 'Handy an die nächste Seilschlaufe halten');
+  const hasWebNfc = 'NDEFReader' in window;
+  const ready = () => hasWebNfc || demo
+    ? setScan('scanning', 'Bereit zum Scannen', 'Handy an die nächste Seilschlaufe halten')
+    : setScan('scanning', 'USB-Leser bereit', 'Seilschlaufe auf den Leser legen');
+
+  // USB-Leser wie der Elatec TWN4 tippen die Chip-ID als Tastatureingabe.
+  // Viele geben sie als Dezimalzahl mit umgekehrter Byte-Reihenfolge aus.
+  function wedgeUid(text) {
+    const t = text.trim();
+    if (!/^\d{9,}$/.test(t)) return t;
+    let hex = BigInt(t).toString(16).toUpperCase();
+    const bytes = Math.ceil(hex.length / 2);
+    hex = hex.padStart((bytes <= 4 ? 4 : bytes <= 7 ? 7 : 10) * 2, '0');
+    return hex.match(/../g).reverse().join(':');
+  }
+  const burst = { chars: '', start: 0, last: 0, snap: null, timer: 0 };
+  function resetBurst() { clearTimeout(burst.timer); burst.chars = ''; burst.snap = null; }
+  function finishBurst(e) {
+    const n = burst.chars.length;
+    const fast = n >= 8 && (burst.last - burst.start) / (n - 1) < 35;
+    if (!fast) return resetBurst();
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    const { snap, chars } = burst;
+    resetBurst();
+    if (snap.input) { snap.input.value = snap.value; snap.input.dispatchEvent(new Event('input')); }
+    if (current && snap.digits !== null) { current.digits = snap.digits; renderCells(); }
+    onTag(wedgeUid(chars));
+  }
+  document.addEventListener('keydown', e => {
+    if (e.ctrlKey || e.altKey || e.metaKey || e.key === 'Shift') return;
+    const now = performance.now();
+    if (/^[0-9a-fA-F:]$/.test(e.key)) {
+      if (!burst.chars || now - burst.last > 60) {
+        resetBurst();
+        const el = document.activeElement;
+        burst.start = now;
+        burst.snap = { input: el?.tagName === 'INPUT' ? el : null, value: el?.value ?? '', digits: current ? current.digits : null };
+      }
+      burst.chars += e.key;
+      burst.last = now;
+      clearTimeout(burst.timer);
+      burst.timer = setTimeout(() => finishBurst(null), 120);
+    } else if ((e.key === 'Enter' || e.key === 'Tab') && burst.chars && now - burst.last < 120) {
+      finishBurst(e);
+    } else resetBurst();
+  }, true);
 
   async function startScan() {
     if (scanning) return;
-    if (demo) { scanning = true; ready(); return; }
+    if (demo || !hasWebNfc) { scanning = true; ready(); return; }
     if (!window.isSecureContext) return setScan('error', 'HTTPS erforderlich', 'NFC funktioniert nur über eine https-Adresse.');
-    if (!('NDEFReader' in window)) return setScan('error', 'NFC nicht verfügbar', 'Bitte in Chrome auf einem Android-Handy öffnen.');
     try {
       const reader = new NDEFReader();
       reader.onreading = e => onTag(e.serialNumber);
@@ -1234,7 +1278,8 @@ dialog h2 { margin: 0; font-size: 18px; }
   }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator && !demo) navigator.serviceWorker.register('sw.js').catch(() => {});
-  if (navigator.permissions && 'NDEFReader' in window) {
+  if (!hasWebNfc) startScan();
+  if (navigator.permissions && hasWebNfc) {
     navigator.permissions.query({ name: 'nfc' }).then(p => { if (p.state === 'granted') startScan(); }).catch(() => {});
   }
   render();
